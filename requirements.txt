@@ -1,12 +1,4 @@
-sys
 json
-pyttsx3
-argparse
-datetime
-random
-collections
-subprocess
 os
-serial
 vk_api
 python-dotenv
