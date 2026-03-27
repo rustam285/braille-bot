@@ -1,4 +1,3 @@
-pygame
 sys
 json
 pyttsx3
