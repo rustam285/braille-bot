@@ -1,11 +1,13 @@
 """
-VK-бот для отслеживания результатов диктантов — версия с PostgreSQL (Supabase).
+VK-бот для отслеживания результатов диктантов — v3
 Установка: pip install vk_api psycopg2-binary python-dotenv
 """
 
 import os
+import re
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from dotenv import load_dotenv
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
@@ -18,73 +20,103 @@ VK_TOKEN = os.getenv("VK_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 DB_URL   = os.getenv("DATABASE_URL")
 
+PAGE_SIZE = 9   # учеников на одной странице (9 + кнопка листания)
+
 # ─────────────────────────────────────────────
-#  БАЗА ДАННЫХ
+#  ПУЛ СОЕДИНЕНИЙ — открывается один раз при старте
+#  Это убирает задержку и ошибки на первом запросе
 # ─────────────────────────────────────────────
+_pool: psycopg2.pool.SimpleConnectionPool = None
+
+def init_pool():
+    global _pool
+    _pool = psycopg2.pool.SimpleConnectionPool(
+        minconn=1, maxconn=5,
+        dsn=DB_URL,
+        connect_timeout=10
+    )
+    print("✅ Пул соединений с БД создан")
+
 def get_conn():
-    return psycopg2.connect(DB_URL)
+    return _pool.getconn()
+
+def put_conn(conn):
+    _pool.putconn(conn)
+
+# ─────────────────────────────────────────────
+#  ЗАПРОСЫ К БД
+# ─────────────────────────────────────────────
+def db_query(sql: str, params=(), fetchone=False, fetchall=False):
+    """Универсальный запрос: берёт соединение из пула, возвращает и освобождает."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(sql, params)
+            if fetchone:
+                return cur.fetchone()
+            if fetchall:
+                return cur.fetchall()
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 def db_get_all_students() -> list:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT student_id FROM students ORDER BY student_id")
-            return [row[0] for row in cur.fetchall()]
+    """Возвращает список учеников, отсортированный по числовому ID."""
+    rows = db_query("SELECT student_id FROM students", fetchall=True)
+    ids  = [r[0] for r in rows]
+    # Сортируем по числу в конце: "Ученик 2" < "Ученик 10"
+    ids.sort(key=lambda s: int(re.search(r'\d+', s).group()) if re.search(r'\d+', s) else 0)
+    return ids
 
 
 def db_get_student_dates(student_id: str) -> list:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT date FROM dictation_results WHERE student_id = %s ORDER BY date",
-                (student_id,)
-            )
-            return [row[0] for row in cur.fetchall()]
+    rows = db_query(
+        "SELECT DISTINCT date FROM dictation_results WHERE student_id = %s ORDER BY date",
+        (student_id,), fetchall=True
+    )
+    return [r[0] for r in rows]
 
 
 def db_get_results_for_date(student_id: str, date: str) -> list:
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(
-                """
-                SELECT r.id, r.dictation_name, r.errors, r.grade,
-                       COALESCE(array_agg(m.word) FILTER (WHERE m.word IS NOT NULL), '{}') AS mistakes
-                FROM dictation_results r
-                LEFT JOIN dictation_mistakes m ON m.result_id = r.id
-                WHERE r.student_id = %s AND r.date = %s
-                GROUP BY r.id
-                ORDER BY r.id
-                """,
-                (student_id, date)
-            )
-            return [dict(row) for row in cur.fetchall()]
+    rows = db_query(
+        """
+        SELECT r.dictation_name, r.errors, r.grade,
+               COALESCE(array_agg(m.word) FILTER (WHERE m.word IS NOT NULL), '{}') AS mistakes
+        FROM dictation_results r
+        LEFT JOIN dictation_mistakes m ON m.result_id = r.id
+        WHERE r.student_id = %s AND r.date = %s
+        GROUP BY r.id
+        ORDER BY r.id
+        """,
+        (student_id, date), fetchall=True
+    )
+    return [dict(r) for r in rows]
 
 
 def db_get_summary(student_id: str) -> dict:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*), SUM(errors), ROUND(AVG(grade), 1), MAX(date), COUNT(DISTINCT date)
-                FROM dictation_results WHERE student_id = %s
-                """,
-                (student_id,)
-            )
-            row = cur.fetchone()
-            return {
-                "total_dictations": row[0] or 0,
-                "total_errors":     row[1] or 0,
-                "avg_grade":        float(row[2]) if row[2] else 0.0,
-                "last_date":        row[3] or "—",
-                "total_sessions":   row[4] or 0,
-            }
+    row = db_query(
+        """
+        SELECT COUNT(*), SUM(errors), ROUND(AVG(grade), 1), MAX(date), COUNT(DISTINCT date)
+        FROM dictation_results WHERE student_id = %s
+        """,
+        (student_id,), fetchone=True
+    )
+    return {
+        "total_dictations": row[0] or 0,
+        "total_errors":     row[1] or 0,
+        "avg_grade":        float(row[2]) if row[2] else 0.0,
+        "last_date":        row[3] or "—",
+        "total_sessions":   row[4] or 0,
+    }
 
 
 def db_student_exists(student_id: str) -> bool:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM students WHERE student_id = %s", (student_id,))
-            return cur.fetchone() is not None
+    row = db_query(
+        "SELECT 1 FROM students WHERE student_id = %s",
+        (student_id,), fetchone=True
+    )
+    return row is not None
 
 # ─────────────────────────────────────────────
 #  КЛАВИАТУРЫ
@@ -99,14 +131,39 @@ def kb_main() -> str:
     return kb.get_keyboard()
 
 
-def kb_student_list(student_ids: list) -> str:
+def kb_student_list(student_ids: list, page: int = 0) -> str:
+    """
+    Страничный список: PAGE_SIZE учеников + стрелки навигации.
+    Кнопки идут по 2 в ряд, последняя строка — навигация.
+    """
+    total_pages = max(1, (len(student_ids) + PAGE_SIZE - 1) // PAGE_SIZE)
+    start = page * PAGE_SIZE
+    chunk = student_ids[start: start + PAGE_SIZE]
+
     kb = VkKeyboard(one_time=True)
-    for i, sid in enumerate(student_ids[:10]):
+    for i, sid in enumerate(chunk):
         kb.add_button(sid, color=VkKeyboardColor.SECONDARY)
-        if (i + 1) % 2 == 0 and i + 1 < len(student_ids[:10]):
+        # Новая строка после каждой второй кнопки (но не после последней)
+        if (i + 1) % 2 == 0 and i + 1 < len(chunk):
             kb.add_line()
+
+    # Навигационная строка
     kb.add_line()
-    kb.add_button("🏠 Главное меню", color=VkKeyboardColor.NEGATIVE)
+    has_prev = page > 0
+    has_next = page < total_pages - 1
+
+    if has_prev and has_next:
+        kb.add_button(f"◀ стр.{page}",   color=VkKeyboardColor.PRIMARY)
+        kb.add_button(f"стр.{page+2} ▶", color=VkKeyboardColor.PRIMARY)
+    elif has_prev:
+        kb.add_button(f"◀ стр.{page}",   color=VkKeyboardColor.PRIMARY)
+        kb.add_button("🏠 Главное меню", color=VkKeyboardColor.NEGATIVE)
+    elif has_next:
+        kb.add_button(f"стр.{page+2} ▶", color=VkKeyboardColor.PRIMARY)
+        kb.add_button("🏠 Главное меню", color=VkKeyboardColor.NEGATIVE)
+    else:
+        kb.add_button("🏠 Главное меню", color=VkKeyboardColor.NEGATIVE)
+
     return kb.get_keyboard()
 
 
@@ -205,7 +262,7 @@ user_state: dict = {}
 
 def get_state(peer_id: int) -> dict:
     if peer_id not in user_state:
-        user_state[peer_id] = {"step": "main", "student": None}
+        user_state[peer_id] = {"step": "main", "student": None, "page": 0}
     return user_state[peer_id]
 
 # ─────────────────────────────────────────────
@@ -218,77 +275,119 @@ def send(vk, peer_id: int, text: str, keyboard: str = None):
     vk.messages.send(**params)
 
 # ─────────────────────────────────────────────
-#  ОБРАБОТЧИК
+#  ВСПОМОГАТЕЛЬНЫЕ
 # ─────────────────────────────────────────────
-def _open_student(vk, peer_id, state, student_id):
+def show_student_list(vk, peer_id, state, page=0):
+    ids = db_get_all_students()
+    state["step"] = "choosing_student"
+    state["page"] = page
+    total_pages   = max(1, (len(ids) + PAGE_SIZE - 1) // PAGE_SIZE)
+    send(vk, peer_id,
+         f"👥 Учеников: {len(ids)} | Страница {page+1}/{total_pages}\nВыберите:",
+         kb_student_list(ids, page))
+
+
+def open_student(vk, peer_id, state, student_id):
     state.update(step="student_menu", student=student_id)
     dates = db_get_student_dates(student_id)
-    send(vk, peer_id, format_summary(student_id) + "\n\nВыберите дату:", kb_student_dates(dates))
+    send(vk, peer_id,
+         format_summary(student_id) + "\n\nВыберите дату:",
+         kb_student_dates(dates))
 
-
+# ─────────────────────────────────────────────
+#  ОБРАБОТЧИК СООБЩЕНИЙ
+# ─────────────────────────────────────────────
 def handle(vk, peer_id: int, text: str):
     state = get_state(peer_id)
     txt   = text.strip()
 
-    if txt.lower() in ("🏠 главное меню", "начало", "старт", "start", "menu", "меню"):
-        state.update(step="main", student=None)
-        send(vk, peer_id, "🏠 Главное меню\nВыберите действие:", kb_main())
+    # ── Старт / главное меню ──────────────────
+    if txt.lower() in ("начало", "старт", "start", "begin", "привет", "hello"):
+        state.update(step="main", student=None, page=0)
+        send(vk, peer_id,
+             "👋 Привет! Я бот для отслеживания результатов диктантов.\n\n"
+             "📚 Здесь преподаватель может:\n"
+             "• Посмотреть прогресс любого ученика\n"
+             "• Узнать оценки и ошибки по каждому диктанту\n"
+             "• Получить сводку по всем ученикам сразу\n\n"
+             "Выберите действие в меню ниже 👇",
+             kb_main())
+        return
+
+    if txt == "🏠 Главное меню":
+        state.update(step="main", student=None, page=0)
+        send(vk, peer_id, "🏠 Главное меню:", kb_main())
         return
 
     if txt == "❓ Помощь":
         send(vk, peer_id,
              "ℹ️ Как пользоваться ботом:\n\n"
-             "📋 Список учеников — все ученики кнопками\n"
+             "📋 Список учеников — все ученики постранично\n"
+             "   (стрелки ◀ ▶ переключают страницы)\n"
              "🔍 Найти ученика — введи «Ученик N» вручную\n"
              "📊 Сводка по всем — статистика по всем сразу\n\n"
-             "После выбора ученика выбери дату или нажми «Все результаты».",
+             "После выбора ученика нажми на дату\n"
+             "или «Все результаты» для полной истории.",
              kb_main())
         return
 
+    # ── Список учеников ───────────────────────
     if txt == "📋 Список учеников":
-        ids = db_get_all_students()
-        send(vk, peer_id,
-             f"👥 Учеников: {len(ids)}\nВыберите:" if ids else "📭 База пуста.",
-             kb_student_list(ids) if ids else kb_main())
-        if ids:
-            state["step"] = "choosing_student"
+        show_student_list(vk, peer_id, state, page=0)
         return
 
+    # Листание страниц (кнопки "◀ стр.N" и "стр.N ▶")
+    prev_match = re.match(r'^◀ стр\.(\d+)$', txt)
+    next_match = re.match(r'^стр\.(\d+) ▶$', txt)
+    if prev_match:
+        show_student_list(vk, peer_id, state, page=int(prev_match.group(1)) - 1)
+        return
+    if next_match:
+        show_student_list(vk, peer_id, state, page=int(next_match.group(1)) - 1)
+        return
+
+    # ── Поиск вручную ────────────────────────
     if txt == "🔍 Найти ученика":
         send(vk, peer_id, "🔍 Введите ID, например: Ученик 5")
         state["step"] = "search"
         return
 
+    if state["step"] == "search":
+        if db_student_exists(txt):
+            open_student(vk, peer_id, state, txt)
+        else:
+            send(vk, peer_id,
+                 f"❌ Ученик «{txt}» не найден.\nПопробуйте ещё раз:",
+                 kb_main())
+        return
+
+    # ── Сводка по всем ───────────────────────
     if txt == "📊 Сводка по всем":
         msgs = format_global_summary()
         for i, msg in enumerate(msgs):
             send(vk, peer_id, msg, kb_main() if i == len(msgs) - 1 else None)
         return
 
+    # ── Назад к списку ────────────────────────
     if txt == "◀ Назад к списку":
-        ids = db_get_all_students()
-        send(vk, peer_id, "👥 Выберите ученика:", kb_student_list(ids))
-        state.update(step="choosing_student", student=None)
+        show_student_list(vk, peer_id, state, page=state.get("page", 0))
         return
 
-    if state["step"] == "search":
-        if db_student_exists(txt):
-            _open_student(vk, peer_id, state, txt)
-        else:
-            send(vk, peer_id, f"❌ Ученик «{txt}» не найден. Попробуйте ещё раз:", kb_main())
-        return
-
+    # ── Выбор ученика из списка ───────────────
     if state["step"] == "choosing_student" and db_student_exists(txt):
-        _open_student(vk, peer_id, state, txt)
+        open_student(vk, peer_id, state, txt)
         return
 
+    # ── Меню ученика ─────────────────────────
     if state["step"] == "student_menu":
         student = state.get("student")
+
         if txt == "📈 Все результаты" and student:
             msgs = format_all_results(student)
             for i, msg in enumerate(msgs):
                 send(vk, peer_id, msg, kb_back() if i == len(msgs) - 1 else None)
             return
+
         if txt.startswith("📅 ") and student:
             date = txt.replace("📅 ", "").strip()
             send(vk, peer_id,
@@ -296,10 +395,12 @@ def handle(vk, peer_id: int, text: str):
                  kb_student_dates(db_get_student_dates(student)))
             return
 
+    # ── Прямой ввод ID (любой шаг) ───────────
     if db_student_exists(txt):
-        _open_student(vk, peer_id, state, txt)
+        open_student(vk, peer_id, state, txt)
         return
 
+    # ── Неизвестная команда ───────────────────
     send(vk, peer_id, "🤷 Не понял. Воспользуйтесь меню:", kb_main())
     state["step"] = "main"
 
@@ -307,10 +408,12 @@ def handle(vk, peer_id: int, text: str):
 #  ЗАПУСК
 # ─────────────────────────────────────────────
 def main():
+    init_pool()   # ← пул соединений создаётся один раз при старте
+
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk         = vk_session.get_api()
     longpoll   = VkBotLongPoll(vk_session, GROUP_ID)
-    print("✅ Бот запущен (PostgreSQL режим)...")
+    print("✅ Бот запущен (PostgreSQL + пул соединений)...")
 
     for event in longpoll.listen():
         if event.type == VkBotEventType.MESSAGE_NEW and event.object.message.get("from_id"):
