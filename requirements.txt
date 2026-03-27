@@ -1,4 +1,2 @@
-json
-os
 vk_api
 python-dotenv
