@@ -11,3 +11,5 @@ MainMenu.py
 resources.py
 sounds/
 images/
+migr.py
+students_db.json
