@@ -1,15 +1,4 @@
 __pycache__/
 *.pyc
 .env
-admin.py
-arduino.py
-braille04.ino
-BrailleAppAdaptive.py
-dictation_module.py
-dictionaries.py
-MainMenu.py
-resources.py
-sounds/
-images/
-migr.py
-students_db.json
+locales/
